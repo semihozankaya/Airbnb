@@ -1,0 +1,553 @@
+---
+title: "Price Prediction Using Airbnb Data"
+author: "Ozan Kaya"
+date: "February 5, 2021"
+output: pdf_document
+code_download: yes
+subtitle: Prediction Models with OLS, LASSO, CART and Random Forests
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, comment = FALSE )
+options(scipen=999)
+library(tidyverse)
+library(caret)
+library(skimr)
+library(grid)
+library(glmnet)
+library(stargazer)
+library(directlabels)
+library(knitr)
+library(cowplot)
+library(modelsummary)
+library(rattle)
+library(ranger)
+library(Hmisc)
+library(kableExtra)
+library(xtable)
+df <- read_csv("/home/ozzy/Documents/CEU/DA3/Assignment 1/Data/clean/airbnb_barcelona_workfile.csv")
+source("/home/ozzy/Documents/CEU/da_case_studies/ch00-tech-prep/theme_bg.R")
+source("/home/ozzy/Documents/CEU/da_case_studies/ch00-tech-prep/da_helper_functions.R")
+
+```
+
+
+This simple paper tries to create a fit on the available Airbnb accomodations on Barcelona, using prices along with other variables, to provide a prediction for new listings that had no related market information before. That is to say, we will be trying to use the existing housing prices to find out how a new entry should be priced. This exercise is limited by apartments only and doesn't offer insight for other property types. 
+
+As the first step into the exercise, I have tried to transform the raw data into a tabular format and also clean some undesirable notation or symbols. The problem with the data at that point was the custom nature of the way the hosts' enter the amenities information about their listings. I choose to create new variables using the mostly used factors and end up with 15 dummy variables that represents the available amenities. I have also created a bathroom type variable with factors shared and private from a set of strings and dropped numerous other variables that I find irrelevant to our question. 
+
+The data I have used can be downloaded from [here](http://data.insideairbnb.com/spain/catalonia/barcelona/2020-12-16/data/listings.csv.gz). This a project by Murray Cox and more information about it is available [here](http://insideairbnb.com/). 
+
+## Data
+```{r}
+#dropping NA in our dependent variable. There are actually none but I still included the code.
+df <- df %>%
+  drop_na(price)
+
+# There are some missing values though. Getting the beds to be equal at least the accomodation value
+# and also assume that there is at least one bedroom.
+df <- df %>%
+  mutate(
+    beds = ifelse(is.na(beds), accommodates, beds),
+    bedrooms = ifelse(is.na(bedrooms), 1, bedrooms)
+  )
+
+#removing some variables with missing values
+df <- df %>% select(-c(license, review_scores_location, calendar_updated, 
+                           neighbourhood, calendar_updated,n_days_since, first_review,
+                           last_review))
+# getting information on bathrooms, if they are private or shared
+df <- df %>% mutate(
+  bathrooms_text = ifelse(is.na(bathrooms_text), 1, bathrooms_text)
+)
+df <- df %>% mutate(
+  bathroom_digits = gsub("[[:digit:]]", "", bathrooms_text),
+  bathroom_chars = gsub("[aA-zZ]", "", bathrooms_text)
+)
+df <- df %>% mutate(
+  bathrooms_type = ifelse(bathroom_digits %in% c(" bath", " baths", " private bath", ". baths", "Half-bath", "Private half-bath", ""), "Private", "Shared" )
+)
+df <- df %>% mutate( bathrooms_count = floor(as.numeric(bathroom_chars)))
+df <- df %>% mutate( bathrooms_count = ifelse(is.na(bathrooms_count), 1, bathrooms_count))
+df <- df %>% mutate( bathrooms_count = ifelse(bathrooms_count == 0, 1, bathrooms_count))
+
+df <- df %>% select(-bathrooms, -host_since)
+df <- df %>% select(-bathroom_digits, -bathroom_chars, -host_response_rate, -host_acceptance_rate)
+
+# there are a small amount of missing host information (17), I assume they are not verified
+df <- df %>% mutate(
+  host_is_superhost = ifelse(is.na(host_is_superhost), 0, host_is_superhost),
+  host_listings_count = ifelse(is.na(host_listings_count), 1, host_listings_count),
+  host_has_profile_pic = ifelse(is.na(host_has_profile_pic), 0, host_has_profile_pic),
+  host_identity_verified = ifelse(is.na(host_identity_verified), 0, host_identity_verified),
+  host_total_listings_count = ifelse(is.na(host_total_listings_count), 1, host_total_listings_count)
+)
+# there are unfortunately a serious amount of missing review scores. People tend to not put on reviews
+# about their hosts. This is a serious assumption but I decide to put the median scores in the missing values
+df <- df %>%
+  mutate(
+    flag_review_scores_rating=ifelse(is.na(review_scores_rating),1, 0),
+    review_scores_rating =  ifelse(is.na(review_scores_rating), median(review_scores_rating, na.rm = T), review_scores_rating)
+      )
+# the statistics for subsets of reviews are fairly close. I choose to remove them entirely since many are
+# missing in the first place
+df <- df %>% select(-c(review_scores_accuracy, review_scores_cleanliness, review_scores_checkin, 
+                           review_scores_communication, review_scores_value, reviews_per_month))
+
+# there are no free apartments
+df <- df %>% filter(price != 0)
+
+# I further limit myself with 2-6 accomodates
+df <- df %>%
+  filter(accommodates < 7
+  )
+df <- df %>%
+  filter(accommodates > 1
+  )
+
+# another constraint on room type where share room count is very low (75)
+df <- df %>% filter(room_type != "Shared room")
+
+# there are some outliers, so I limit my data for visualization only
+dfu <- df %>% filter(price <= 200)
+
+df$ln_price <- log(df$price)
+dfu$ln_price <- log(dfu$price)
+
+
+
+```
+The raw data consists of many categorical variables, binaries and some numerical values. Since we want to predict the price, I will try to understand which variables have the strongest pattern of association with the accomodation price. At first glance, the accomodation itself, its location, reviews of past users and host of the apartment seems to be the major categories we can include variables from. 
+
+```{r, results = "asis"}
+# Now check some summary statistics and prepare a table for it
+var_to_summarize <- c("price", "accommodates", "bathrooms_count", "number_of_reviews", 
+                      "review_scores_rating")
+stats_to_summarize <- c("Mean", "Median", "Std", "IQR", "Min", "Max", "numObs" )
+
+df_summary <- select(df, all_of(var_to_summarize))
+
+summary_table <- tibble(`Price` = rep(0, 7), `Accomodates` = rep(0,7), `Bathroom Count` = rep(0, 7), `Review Count` = rep(0, 7), `Review Scores` = rep(0, 7))
+
+
+for(i in 1:length(names(summary_table))){
+  summary_table[,i] <- df_summary %>%
+    summarise(mean  = mean(df_summary[[i]], na.rm = TRUE),
+            median   = median(df_summary[[i]], na.rm = TRUE),
+            std      = sd(df_summary[[i]], na.rm = TRUE),
+            iq_range = IQR(df_summary[[i]], na.rm = TRUE), 
+            min      = min(df_summary[[i]], na.rm = TRUE),
+            max      = max(df_summary[[i]], na.rm = TRUE),
+            numObs   = sum( !is.na( df_summary[[i]] ) ) ) %>% t()
+}
+summary_table_var <- tibble(Statistics = stats_to_summarize)
+
+for(i in 1:5){
+  summary_table[[i]] <- format(round(summary_table[[i]], 0), nsmall=0, big.mark=",")
+  }
+
+summary_table <- cbind(summary_table_var, summary_table)
+summary_xtable <- xtable(summary_table, caption = "Selected summary statistics")
+
+print(summary_xtable, comment=FALSE, include.rownames=FALSE)
+
+
+```
+
+I start with checking our dependent variable, the price. It seems that a large portion of the observations are under 200 Euros per night. However there are distinct outliers such as 10.000 Euros for a single night along with a wide dispersion among the observations. The distribution itself, that can be seen below on the left, is skewed and it has a relatively long right tail. A log transformation is also presented on the right and it provides a distribution more closely related with that of a normal distribution.
+
+```{r, out.width='50%'}
+g1a <- ggplot(data=dfu, aes(x=price)) +
+  geom_histogram_da(type="percent", binwidth = 10) +
+  #geom_histogram(aes(y = (..count..)/sum(..count..)), binwidth = 10, boundary=0,
+  #               color = color.outline, fill = color[1], size = 0.25, alpha = 0.8,  show.legend=F,  na.rm=TRUE) +
+  #  coord_cartesian(xlim = c(0, 400)) +
+  labs(x = "Price",y = "Percent")+
+  scale_y_continuous(expand = c(0.00,0.00),limits=c(0, 0.16), breaks = seq(0, 0.16, by = 0.02), labels = scales::percent_format(1)) +
+  scale_x_continuous(expand = c(0.00,0.00),limits=c(0,220), breaks = seq(0,220, 20)) +
+  theme_bg()  
+g1a
+
+g1b<- ggplot(data=dfu, aes(x=ln_price)) +
+  geom_histogram_da(type="percent", binwidth = 0.2) +
+  #  geom_histogram(aes(y = (..count..)/sum(..count..)), binwidth = 0.18,
+  #               color = color.outline, fill = color[1], size = 0.25, alpha = 0.8,  show.legend=F,  na.rm=TRUE) +
+  coord_cartesian(xlim = c(2, 5.5)) +
+  scale_y_continuous(expand = c(0.00,0.00),limits=c(0, 0.15), breaks = seq(0, 0.15, by = 0.02), labels = scales::percent_format(5L)) +
+  scale_x_continuous(expand = c(0.00,0.00),limits = c(0, 6), breaks = seq(0.2, 5.5, 0.2)) +
+  labs(x = "log(price)",y = "Percent")+
+  theme_bg() 
+g1b
+
+```
+
+Another important determinant of price seems to be the type of the room. The majority of our observations belong to entire houses but a certain number of listings are for private rooms as well. Not surprisingly, we see a notable difference between their prices that can be onserved on the first graph below. 
+
+On the other hand, when we take a more granular look into the observations, we see that with higher number of accomodation opportunuties, the prices are naturally increasing. But interestingly, the dispersion of private room prices are increasing as well. That is mostly due to lower number of observations since low accomodation rates in small houses seem to suggests homeowners' renting out their property whereas large accomodations in private rooms seem to offer a more professional setup. This can be seen at the graph to the right.
+
+By common sense, we can also guess that the neighbourhood of a house is an important determinant of its price. There is a stark distinction between some of the neighbourhoods but this is fairly visible with the entire apartment prices. For private rooms, the difference is visible but relatively less notable. This can be seen at the bottom graph below.
+
+```{r, out.width='50%'}
+
+g2 <- ggplot(data = dfu, aes(x = room_type, y = price)) +
+  stat_boxplot(aes(group = room_type), geom = "errorbar", width = 0.3,
+               color = c(color[2],color[1]), size = 0.5, na.rm=T)+
+  geom_boxplot(aes(group = room_type),
+               color = c(color[2],color[1]), fill = c(color[2],color[1]),
+               size = 0.5, width = 0.6, alpha = 0.3, na.rm=T, outlier.shape = NA) +
+  scale_y_continuous(expand = c(0.01,0.01),limits = c(0,200), breaks = seq(0,200,50)) +
+  labs(x = "Room type",y = "Price")+
+  theme_bg()
+g2
+
+g3 <- ggplot(dfu, aes(x = factor(accommodates), y = price,
+                        fill = factor(room_type), color=factor(room_type))) +
+  geom_boxplot(alpha=0.8, na.rm=T, outlier.shape = NA, width = 0.8) +
+  stat_boxplot(geom = "errorbar", width = 0.8, size = 0.3, na.rm=T)+
+  scale_color_manual(name="",
+                     values=c(color[2],color[1])) +
+  scale_fill_manual(name="",
+                    values=c(color[2],color[1])) +
+  labs(x = "Accomodates (Persons)",y = "Price")+
+  scale_y_continuous(expand = c(0.01,0.01), limits=c(0, 200), breaks = seq(0,200, 50))+
+  theme_bg() +
+  theme(legend.position = c(0.3,0.8)        )
+g3
+
+
+```
+
+```{r}
+
+
+g4 <- ggplot(dfu, aes(x = factor(neighbourhood_group_cleansed), y = price,
+                        fill = factor(room_type), color=factor(room_type))) +
+  geom_boxplot(alpha=0.8, na.rm=T, outlier.shape = NA, width = 0.8) +
+  stat_boxplot(geom = "errorbar", width = 0.8, size = 0.3, na.rm=T)+
+  scale_color_manual(name="",
+                     values=c(color[2],color[1])) +
+  scale_fill_manual(name="",
+                    values=c(color[2],color[1])) +
+  labs(x = "Neighbourhoods",y = "Price")+
+  scale_y_continuous(expand = c(0.01,0.01), limits=c(0, 200), breaks = seq(0,200, 50))+
+  theme_bg() +
+  theme(legend.position = c(0.3,0.8)        )
+g4
+```
+
+
+## Model
+
+```{r}
+# Basic Variables
+basic_var  <- c("accommodates", "bedrooms", "room_type", "bathrooms_type","bathrooms_count", "neighbourhood_group_cleansed" )
+df <- df %>% mutate(host_professional = ifelse(host_total_listings_count > 3, "Professional", "Individual"))
+host_var <- c("host_is_superhost", "host_has_profile_pic", "host_identity_verified", "host_professional")
+df <- df %>% mutate(seeked = ifelse(availability_365 > 300, 0, 1))
+df <- df %>% mutate(is_reviewed = ifelse(number_of_reviews > 0, 1, 0))
+reviews <- c("seeked", "number_of_reviews", "review_scores_rating", "is_reviewed")
+amenities <- c("a_balcony", "a_garden", "a_fireplace", "a_outdoors", "a_pool", "a_breakfast", "a_air_conditioning",
+               "a_parking", "a_working_space", "a_child_friendly", "a_gym", "a_gaming", "a_kitchen",
+               "a_pets")
+
+X1  <- c("bathrooms_type*seeked",  "room_type*a_child_friendly", "a_pool*a_outdoors", 
+         "review_scores_rating*is_reviewed","neighbourhood_group_cleansed*seeked")
+
+```
+
+I have started considerin the structure of my linear models by trying to take a look at the interactions between variables as well as trying to check the summary statistics of the numerical variables. Price of any listing seems to be heavily influenced by some simple variables that anybody would think of first when trying to price an apartment. In my initial model, I decided to include accomodation number, bedroom and bathroom counts, bathroom and room types and the neighbourhood. 
+
+As discussed before, I also wanted to include information about the host and the experiences of past users into my models as well. While checking relevant variables for this purpose, I have decided to include three more variables to my model. The first one is about the total listings a single host owns. I decided a large number of listings would propose a professional behind the daily operations of this apartments and the pricing mechanisms for these listings might be different than others. The second inclusion was about the review counts. It seems that a good portion of the listings have no reviews. This could suggest that the listing is relatively new and not many people have stayed there so far but it also means the pricing of the listing doesn't reflect the market and people are not demanding it. In either case, the price information might be different for them relative to others. The last variable is closely related to this idea, where I controlled for the availability variable which shows how many days the listing was available in the past 30, 90 and 365 days. I choose the 1 year alternative since there could be serious seasonality regarding airbnb listings and I wanted to avoid that. The new variable is a dummy variable that takes the value 0 if the apartment was available more than 300 days in the past year. 
+
+These being dealt with, I have included the dummy variables that shows if the host is a superhost, has a profile picture, if its identity is verified and finally if it has more than 3 listings in total as my variables regarding the host of the apartment. I have later on determined the number of reviews, the review score, is the apartment is reviewed and finally was the apartment available more than 300 days in the past year as my variables about the reviews or namely the past experiences. Another inclusion will be the amenities provided to the customers such as a pool, outdoor facilities like a barbeque or a garden, a balcony and so on, each represented as a dummy variable. The final addition will be the possible interactions between the variables. I have tried to explore as many alternatives as I can and I tried to plot some of the more interesting ones. The plots can be seen below. At the end, I decided to control for the bathroom types and the neighbourhoods interactions with last years availability measure, as well as interactions with room type and child friendly apartments among others in my models.   
+
+
+```{r}
+p1 <- price_diff_by_variables2(df, "room_type", "a_child_friendly", "Room Type", "Child Friendly")
+p2 <- price_diff_by_variables2(df, "neighbourhood_group_cleansed", "seeked", "Neighbourhood", "High Demand Last Year")
+p3 <- price_diff_by_variables2(df, "bathrooms_type", "seeked", "Bathroom Type", "High Demand Last Year")
+p4 <- price_diff_by_variables2(df, "room_type", "host_professional", "Room Type", "Host Has Multiple Listings")
+p5 <- price_diff_by_variables2(df, "host_has_profile_pic", "is_reviewed", "Host Has Profile Pic", "Is Reviewed")
+p6 <- price_diff_by_variables2(df, "a_pool", "a_outdoors", "Pool Facilities", "Outdoor Facilities")
+
+g_interactions <- plot_grid(p1, p2, p3, p4, p5, p6, nrow=3, ncol=2)
+g_interactions
+```
+
+```{r}
+modellev1 <- " ~ accommodates"
+modellev2 <- paste0(" ~ ",paste(basic_var,collapse = " + "))
+modellev3 <- paste0(" ~ ",paste(c(basic_var, "neighbourhood_group_cleansed",reviews),collapse = " + "))
+modellev4 <- paste0(" ~ ",paste(c(basic_var,"neighbourhood_group_cleansed",reviews, host_var),collapse = " + "))
+modellev5 <- paste0(" ~ ",paste(c(basic_var,"neighbourhood_group_cleansed",reviews, host_var,X1),collapse = " + "))
+modellev6 <- paste0(" ~ ",paste(c(basic_var,"neighbourhood_group_cleansed",reviews, host_var,X1,amenities),collapse = " + "))
+```
+
+```{r}
+# a holdout set (20% of observations)
+smp_size <- floor(0.2 * nrow(df))
+
+# Set the seed and make the partition
+set.seed(12345678)
+holdout_ids <- sample(seq_len(nrow(df)), size = smp_size)
+df$holdout <- 0
+df$holdout[holdout_ids] <- 1
+
+#Hold-out set Set
+df_holdout <- df %>% filter(holdout == 1)
+
+#Working data set
+df_work <- df %>% filter(holdout == 0)
+
+# folds = 5
+n_folds=5
+# Create the folds
+set.seed(123456789)
+folds_i <- sample(rep(1:n_folds, length.out = nrow(df_work) ))
+# Create results
+model_results_cv <- list()
+
+
+for (i in (1:6)){
+  model_name <-  paste0("modellev",i)
+  model_pretty_name <- paste0("(",i,")")
+  
+  yvar <- "ln_price"
+  xvars <- eval(parse(text = model_name))
+  formula <- formula(paste0(yvar,xvars))
+  
+  # Initialize values
+  rmse_train <- c()
+  rmse_test <- c()
+  
+  model_work_df <- lm(formula,data = df_work)
+  BIC <- BIC(model_work_df)
+  nvars <- model_work_df$rank -1
+  r2 <- summary(model_work_df)$r.squared
+  
+  # Do the k-fold estimation
+  for (k in 1:n_folds) {
+    test_i <- which(folds_i == k)
+    # Train sample: all except test_i
+    df_train <- df_work[-test_i, ]
+    # Test sample
+    df_test <- df_work[test_i, ]
+    # Estimation and prediction
+    model <- lm(formula,data = df_train)
+    prediction_train <- predict(model, newdata = df_train)
+    prediction_test <- predict(model, newdata = df_test)
+    
+    # Criteria evaluation
+    rmse_train[k] <- mse_lev(prediction_train, df_train[,yvar] %>% pull)**(1/2)
+    rmse_test[k] <- mse_lev(prediction_test, df_test[,yvar] %>% pull)**(1/2)
+    
+  }
+  
+  model_results_cv[[model_name]] <- list(yvar=yvar,xvars=xvars,formula=formula,model_work_df=model_work_df,
+                                         rmse_train = rmse_train,rmse_test = rmse_test,BIC = BIC,
+                                         model_name = model_pretty_name, nvars = nvars, r2 = r2)
+}
+```
+
+##OLS
+At the end, I have decided to use the log transformation of price as my dependent variable and built 6 different linear models with relatively simple setups. I have started with accomodates as the only variable in a simple regression and slowly increased the number of regressors with each model. The initial model had an $R^2$ of 0.26 and an RMSE measure of 0.602. Inclusion of the basic variables I have listed above greatly reduced the mean squared errors to 0.578. The most inclusive model with 48 variables had the best test RMSE at the end with 0.570 and also with an $R^2$ of 0.34. Additionally, when we check our most inclusive model with our holdout set that we have put aside in the beginning of our analysis, the RMSE comes out to be 0.574. Compared to other alternatives, our last model is the best when used in an out of sample analysis as well. 
+
+```{r, results='asis'}
+
+t1 <- imap(model_results_cv,  ~{
+  as.data.frame(.x[c("rmse_test", "rmse_train")]) %>%
+    dplyr::summarise_all(.funs = mean) %>%
+    mutate("model_name" = .y , "model_pretty_name" = .x[["model_name"]] ,
+           "nvars" = .x[["nvars"]], "r2" = .x[["r2"]], "BIC" = .x[["BIC"]])
+}) %>%
+  bind_rows()
+column_names <- c("Model", "N predictors", "R-squared", "BIC", "Training RMSE",
+                  "Test RMSE")
+
+t1_2 <- t1 %>%
+  select("model_pretty_name", "nvars", "r2" , "BIC", "rmse_train", "rmse_test")
+colnames(t1_2) <- column_names
+print(xtable(t1_2, type = "latex", digits=c(0,0,0,2,0,3,3)),
+      include.rownames=FALSE, booktabs=TRUE, floating = TRUE, comment = FALSE)
+```
+
+\pagebreak
+##LASSO
+
+I later on tried the LASSO method using my most inclusive model and tried to check if LASSO provides a better fit. Since LASSO is particularly useful when there are many variables available relative to observation points, for our case I wasn't expecting a significant improvement in my OLS regressions. Due to this fact, the lambda parameter is choosen as 0.05 by our algorithm and it resulted with 7 non-zero coefficients in the end. However, the test RMSE value was worse then our simple regression.
+
+```{r, results='asis'}
+# chosing the most inclusive model
+vars_model_7 <- c("ln_price", "neighbourhood_group_cleansed",reviews, host_var,X1,amenities)
+
+# Set lasso tuning parameters and the regression formula
+train_control <- trainControl(method = "cv", number = n_folds)
+tune_grid <- expand.grid("alpha" = c(1), "lambda" = seq(0.05, 1, by = 0.05))
+formula <- formula(paste0("ln_price ~ ", paste(setdiff(vars_model_7, "price"), collapse = " + ")))
+
+set.seed(1234)
+lasso_model <- caret::train(formula,
+                            data = df_work,
+                            method = "glmnet",
+                            preProcess = c("center", "scale"),
+                            trControl = train_control,
+                            tuneGrid = tune_grid,
+                            na.action=na.exclude)
+
+lasso_coeffs <- coef(lasso_model$finalModel, lasso_model$bestTune$lambda) %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "variable") %>%
+  rename(coefficient = `1`)
+
+lasso_coeffs_nz<-lasso_coeffs %>%
+  filter(coefficient!=0)
+
+# Evaluate model. CV error:
+lasso_cv_rmse <- lasso_model$results %>%
+  filter(lambda == lasso_model$bestTune$lambda) %>%
+  dplyr::select(RMSE)
+t1_2[7,] <- c(7, nrow(lasso_coeffs_nz), round(lasso_model$results[1,4], 2), "-", "-", round(lasso_model$results[1,3],3))
+t1_2[3] <- round(as.numeric(t1_2[[3]]), 2)
+t1_2[4] <- round(as.numeric(t1_2[[4]]), 0)
+t1_2[5] <- round(as.numeric(t1_2[[5]]), 3)
+t1_2[6] <- round(as.numeric(t1_2[[6]]), 3)
+
+
+              
+print(xtable(t1_2, type = "latex", digits=c(0,0,0,2,0,3,3)),
+      include.rownames=FALSE, booktabs=TRUE, floating = TRUE, comment = FALSE)              
+```
+
+# CART and Random Forest
+
+
+```{r, results='hide'}
+
+# setting our predictors
+predictors_1 <- c(basic_var)
+predictors_2 <- c(basic_var, "neighbourhood_group_cleansed", reviews, host_var)
+predictors_E <- c(basic_var, "neighbourhood_group_cleansed", reviews, host_var, X1, amenities)
+
+# do 5-fold CV
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              verboseIter = FALSE)
+
+
+# CART
+set.seed(1234)
+system.time({
+  cart_model <- train(
+    formula(paste0("ln_price ~", paste0(predictors_E, collapse = " + "))),
+    data = df_work,
+    method = "rpart",
+    tuneLength = 10,
+    trControl = train_control
+  )
+})
+
+
+
+# set tuning
+tune_grid <- expand.grid(
+  .mtry = c(5, 7, 9),
+  .splitrule = "variance",
+  .min.node.size = c(5, 10)
+)
+
+
+# simpler model for model A (1)
+set.seed(12345)
+system.time({
+  rf_model_1 <- train(
+    formula(paste0("ln_price ~", paste0(predictors_1, collapse = " + "))),
+    data = df_work,
+    method = "ranger",
+    trControl = train_control,
+    tuneGrid = tune_grid,
+    importance = "impurity"
+  )
+})
+#rf_model_1
+
+# set tuning for benchamrk model (2)
+tune_grid <- expand.grid(
+  .mtry = c(8, 10, 12),
+  .splitrule = "variance",
+  .min.node.size = c(5, 10, 15)
+)
+
+set.seed(1234)
+system.time({
+  rf_model_2 <- train(
+    formula(paste0("ln_price ~", paste0(predictors_E, collapse = " + "))),
+    data = df_work,
+    method = "ranger",
+    trControl = train_control,
+    tuneGrid = tune_grid,
+    importance = "impurity"
+  )
+})
+
+#rf_model_2
+
+```
+
+After exploring the more conventional methods, I also decided to implement regression trees into my analysis. I begin with a simple CART with my most inclusive variable set. The previous linear regressions coefficients have shown rather little variance so as expected, CART have performed not teribly but still lacks the random forest's 'wisdom of crowds'. Nevertheless, with a complexity parameter of `r round(cart_model$results[1,1],4)` and an RMSE of `r round(cart_model$results[1,2],3)` it is a relatively robust predictive model. 
+
+```{r, results = 'asis'}
+
+t1_2[8,] <- c("CART", "-", round(cart_model$results[1,3], 2), "-", "-", round(cart_model$results[1,2],3))
+t1_2[9,] <- c("Forest", "-", round(filter(rf_model_2$results, RMSE == min(rf_model_2$results$RMSE))$Rsquared, 2), "-", "-", round(min(rf_model_2$results$RMSE),3))
+t1_2[3] <- round(as.numeric(t1_2[[3]]), 2)
+t1_2[4] <- round(as.numeric(t1_2[[4]]), 0)
+t1_2[5] <- round(as.numeric(t1_2[[5]]), 3)
+t1_2[6] <- round(as.numeric(t1_2[[6]]), 3)
+
+
+print(xtable(t1_2, type = "latex", digits=c(0,0,0,2,0,3,3)),
+      include.rownames=FALSE, booktabs=TRUE, floating = TRUE, comment = FALSE)  
+
+```
+
+However, I expect a significant improvement with a random forest where the aggregation of single trees into a tree would naturally smooth the variance that is natural within single regression trees. I wanted to see how the inclusion of other variables effect the performance of my forests and I was amazed by how reliable results that it can produce. With the most basic variable set we have, the forest's RMSE is `r  round(min(rf_model_1$results$RMSE),3)` whereas as a result of the inclusion of new variables the model improves significantly and with the most inclusive variable set the RMSE falls to `r  round(min(rf_model_2$results$RMSE),3)`. This is a significant improvement among all of our models. The interpretability might be an issue with trees or forests of course by the below variable importance plot solves most ouf our problems and offers a good interpretation of the variables. 
+
+```{r}
+
+group.importance <- function(rf.obj, groups) {
+  var.imp <- as.matrix(sapply(groups, function(g) {
+    sum(importance(rf.obj)[g], na.rm = TRUE)
+  }))
+  colnames(var.imp) <- "MeanDecreaseGini"
+  return(var.imp)
+}
+
+rf_model_2_var_imp <- importance(rf_model_2$finalModel)/1000
+
+rf_model_2_var_imp_df <-
+  data.frame(varname = names(rf_model_2_var_imp),imp = rf_model_2_var_imp) %>%
+  arrange(desc(imp)) %>%
+  mutate(imp_percentage = imp/sum(imp))
+
+rf_model_2_var_imp_plot_b <- ggplot(rf_model_2_var_imp_df[1:10,], aes(x=reorder(varname, imp), y=imp_percentage)) +
+  geom_point(color=color[1], size=1) +
+  geom_segment(aes(x=varname,xend=varname,y=0,yend=imp_percentage), color=color[1], size=0.75) +
+  ylab("Importance (Percent)") +
+  xlab("Variable Name") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_bg() +
+  theme(axis.text.x = element_text(size=6), axis.text.y = element_text(size=6),
+        axis.title.x = element_text(size=6), axis.title.y = element_text(size=6))
+rf_model_2_var_imp_plot_b
+
+```
+
+
+
+
+
+## Summary
+
+In this humble analysis, I have tried to find the association between house prices in the city of Barcelona using the publicly available airbnb listing prices from inside airbnb project. The aim was to provide an educated guess for new entries to the market, that is to say to provide price predictions for houses with given characteristics. I have built linear models and used methods like OLS and LASSO and I also built regression trees and also forests for this task. The end result is the uncontested victory of the random forest followed by conventional OLS estimates. 
